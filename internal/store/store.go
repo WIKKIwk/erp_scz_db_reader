@@ -48,12 +48,18 @@ SELECT
 	COALESCE(NULLIF(item_code, ''), name) AS item_code,
 	COALESCE(NULLIF(item_name, ''), NULLIF(item_code, ''), name) AS item_name
 FROM tabItem
+WHERE EXISTS (
+	SELECT 1
+	FROM tabBin
+	WHERE tabBin.item_code = COALESCE(NULLIF(tabItem.item_code, ''), tabItem.name)
+		AND tabBin.actual_qty > 0
+)
 `
 	args := make([]any, 0, 5)
 	if query != "" {
 		pattern := "%" + query + "%"
 		sqlText += `
-WHERE item_code LIKE ? OR item_name LIKE ? OR name LIKE ?
+AND (tabItem.item_code LIKE ? OR tabItem.item_name LIKE ? OR tabItem.name LIKE ?)
 `
 		args = append(args, pattern, pattern, pattern)
 	}
