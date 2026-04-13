@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 type Item struct {
@@ -41,6 +43,7 @@ func New(db *sql.DB) *Store {
 func (s *Store) SearchItems(ctx context.Context, query string, limit int) ([]Item, error) {
 	limit = normalizeLimit(limit)
 	query = strings.TrimSpace(query)
+	terms := searchTerms(query)
 
 	sqlText := `
 SELECT
@@ -50,24 +53,24 @@ SELECT
 FROM tabItem
 WHERE EXISTS (
 	SELECT 1
-	FROM tabBin
-	WHERE tabBin.item_code = COALESCE(NULLIF(tabItem.item_code, ''), tabItem.name)
-		AND tabBin.actual_qty > 0
+	FROM ` + "`tabItem Default`" + ` item_default
+	WHERE item_default.parent = tabItem.name
+		AND COALESCE(NULLIF(item_default.default_warehouse, ''), '') <> ''
 )
 `
-	args := make([]any, 0, 5)
-	if query != "" {
-		pattern := "%" + query + "%"
-		sqlText += `
-AND (tabItem.item_code LIKE ? OR tabItem.item_name LIKE ? OR tabItem.name LIKE ?)
-`
-		args = append(args, pattern, pattern, pattern)
-	}
+	args := make([]any, 0, 4)
 	sqlText += `
 ORDER BY modified DESC
 LIMIT ?
 `
-	args = append(args, limit)
+	queryLimit := limit
+	if len(terms) > 0 && queryLimit < 2000 {
+		queryLimit = 2000
+	}
+	if queryLimit > 5000 {
+		queryLimit = 5000
+	}
+	args = append(args, queryLimit)
 
 	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
@@ -94,6 +97,12 @@ LIMIT ?
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("search items rows: %w", err)
+	}
+	if len(terms) > 0 {
+		items = rankItems(items, terms)
+		if len(items) > limit {
+			items = items[:limit]
+		}
 	}
 	return items, nil
 }
@@ -143,12 +152,27 @@ func (s *Store) SearchItemWarehouses(ctx context.Context, itemCode, query string
 	query = strings.TrimSpace(query)
 
 	sqlText := `
-SELECT warehouse, actual_qty
-FROM tabBin
-WHERE item_code = ? AND actual_qty > 0
+SELECT warehouse, MAX(actual_qty) AS actual_qty
+FROM (
+	SELECT warehouse, actual_qty
+	FROM tabBin
+	WHERE item_code = ? AND actual_qty > 0
+
+	UNION ALL
+
+	SELECT DISTINCT
+		item_default.default_warehouse AS warehouse,
+		0 AS actual_qty
+	FROM tabItem
+	INNER JOIN ` + "`tabItem Default`" + ` item_default
+		ON item_default.parent = tabItem.name
+	WHERE (tabItem.item_code = ? OR tabItem.name = ?)
+		AND COALESCE(NULLIF(item_default.default_warehouse, ''), '') <> ''
+) warehouse_options
+WHERE 1 = 1
 `
-	args := make([]any, 0, 3)
-	args = append(args, itemCode)
+	args := make([]any, 0, 6)
+	args = append(args, itemCode, itemCode, itemCode)
 
 	if query != "" {
 		sqlText += `AND warehouse LIKE ?
@@ -157,6 +181,7 @@ WHERE item_code = ? AND actual_qty > 0
 	}
 
 	sqlText += `
+GROUP BY warehouse
 ORDER BY actual_qty DESC, warehouse ASC
 LIMIT ?
 `
@@ -222,4 +247,306 @@ func normalizeLimit(limit int) int {
 		return 50
 	}
 	return limit
+}
+
+func searchTerms(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+	add := func(value string) {
+		value = normalizedSearchText(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	add(query)
+	add(transliterateUzbek(query))
+	return out
+}
+
+func normalizedSearchText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	lastSpace := false
+	for _, r := range value {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastSpace = false
+		case unicode.IsSpace(r) || r == '-' || r == '_' || r == '\'' || r == '`' || r == '’':
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func transliterateUzbek(value string) string {
+	replacer := strings.NewReplacer(
+		"o'", "o",
+		"g'", "g",
+		"sh", "s",
+		"ch", "c",
+		"yo", "io",
+		"yu", "iu",
+		"ya", "ia",
+		"ё", "yo",
+		"ю", "yu",
+		"я", "ya",
+		"ш", "sh",
+		"ч", "ch",
+		"ғ", "g",
+		"ў", "o",
+		"қ", "q",
+		"ҳ", "h",
+		"й", "y",
+		"ц", "s",
+		"ы", "i",
+		"э", "e",
+		"ъ", "",
+		"ь", "",
+		"а", "a",
+		"б", "b",
+		"в", "v",
+		"г", "g",
+		"д", "d",
+		"е", "e",
+		"ж", "j",
+		"з", "z",
+		"и", "i",
+		"к", "k",
+		"л", "l",
+		"м", "m",
+		"н", "n",
+		"о", "o",
+		"п", "p",
+		"р", "r",
+		"с", "s",
+		"т", "t",
+		"у", "u",
+		"ф", "f",
+		"х", "x",
+		"ь", "",
+		"й", "y",
+	)
+	return replacer.Replace(strings.ToLower(value))
+}
+
+func rankItems(items []Item, terms []string) []Item {
+	type scoredItem struct {
+		item  Item
+		score int
+	}
+	scored := make([]scoredItem, 0, len(items))
+	for _, item := range items {
+		score := scoreItemMatch(item, terms)
+		if score <= 0 {
+			continue
+		}
+		scored = append(scored, scoredItem{item: item, score: score})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return scored[i].item.ItemCode < scored[j].item.ItemCode
+	})
+	out := make([]Item, 0, len(scored))
+	for _, entry := range scored {
+		out = append(out, entry.item)
+	}
+	return out
+}
+
+func scoreItemMatch(item Item, terms []string) int {
+	fields := []string{
+		normalizedSearchText(item.ItemCode),
+		normalizedSearchText(item.ItemName),
+		normalizedSearchText(item.Name),
+		normalizedSearchText(transliterateUzbek(item.ItemCode)),
+		normalizedSearchText(transliterateUzbek(item.ItemName)),
+		normalizedSearchText(transliterateUzbek(item.Name)),
+	}
+	score := 0
+	for _, term := range terms {
+		best := 0
+		for _, field := range fields {
+			best = max(best, fuzzyFieldScore(field, term))
+		}
+		score += best
+	}
+	return score
+}
+
+func fuzzyFieldScore(field, term string) int {
+	field = normalizedSearchText(field)
+	term = normalizedSearchText(term)
+	if field == "" || term == "" {
+		return 0
+	}
+	fieldCompact := compactField(field)
+	termCompact := compactField(term)
+	switch {
+	case field == term:
+		return 120
+	case strings.HasPrefix(field, term):
+		return 100
+	case fieldCompact == termCompact:
+		return 99
+	case strings.HasPrefix(fieldCompact, termCompact):
+		return 98
+	case strings.Contains(field, " "+term):
+		return 90
+	case strings.Contains(field, term):
+		return 75
+	case strings.Contains(fieldCompact, termCompact):
+		return 72
+	case tokenTypoScore(field, term) > 0:
+		return tokenTypoScore(field, term)
+	case subsequenceMatch(fieldCompact, termCompact):
+		return 55
+	case levenshteinDistance(field, term) <= 1:
+		return 45
+	case levenshteinDistance(fieldCompact, termCompact) <= 1:
+		return 44
+	case levenshteinDistance(firstToken(field), term) <= 1:
+		return 40
+	case levenshteinDistance(firstToken(fieldCompact), termCompact) <= 1:
+		return 39
+	default:
+		return 0
+	}
+}
+
+func compactField(value string) string {
+	return strings.ReplaceAll(normalizedSearchText(value), " ", "")
+}
+
+func firstToken(value string) string {
+	if value == "" {
+		return ""
+	}
+	parts := strings.Fields(value)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
+func subsequenceMatch(field, term string) bool {
+	if len(term) < 3 {
+		return false
+	}
+	target := []rune(term)
+	idx := 0
+	for _, r := range field {
+		if idx < len(target) && r == target[idx] {
+			idx++
+			if idx == len(target) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func tokenTypoScore(field, term string) int {
+	if term == "" {
+		return 0
+	}
+	best := 0
+	for _, token := range strings.Fields(field) {
+		token = compactField(token)
+		if token == "" {
+			continue
+		}
+		if token == term {
+			return 110
+		}
+		if strings.HasPrefix(token, term) {
+			best = max(best, 97)
+			continue
+		}
+		if strings.Contains(token, term) {
+			best = max(best, 74)
+			continue
+		}
+		if levenshteinDistance(token, term) <= 1 {
+			best = max(best, 68)
+			continue
+		}
+		if len(term) >= 4 && len(token) >= 4 && subsequenceMatch(token, term) {
+			best = max(best, 58)
+		}
+	}
+	return best
+}
+
+func levenshteinDistance(left, right string) int {
+	if left == right {
+		return 0
+	}
+	if left == "" {
+		return len([]rune(right))
+	}
+	if right == "" {
+		return len([]rune(left))
+	}
+	lr := []rune(left)
+	rr := []rune(right)
+	prev := make([]int, len(rr)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(lr); i++ {
+		cur := make([]int, len(rr)+1)
+		cur[0] = i
+		for j := 1; j <= len(rr); j++ {
+			cost := 0
+			if lr[i-1] != rr[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(
+				prev[j]+1,
+				cur[j-1]+1,
+				prev[j-1]+cost,
+			)
+		}
+		prev = cur
+	}
+	return prev[len(rr)]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
