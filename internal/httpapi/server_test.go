@@ -57,6 +57,26 @@ func TestItemsEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandshakeEndpoint(t *testing.T) {
+	h := NewHandler(fakeSearcher{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/handshake", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["service"] != "gscale_erp_read" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
 func TestWarehousesEndpoint(t *testing.T) {
 	h := NewHandler(fakeSearcher{
 		stocks: []store.WarehouseStock{{Warehouse: "Stores - A", ActualQty: 12.5}},

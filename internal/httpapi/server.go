@@ -22,6 +22,12 @@ func NewHandler(s searcher) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("GET /v1/handshake", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"service": "gscale_erp_read",
+		})
+	})
 	mux.HandleFunc("GET /v1/items", func(w http.ResponseWriter, r *http.Request) {
 		items, err := s.SearchItems(r.Context(), r.URL.Query().Get("query"), parseLimit(r))
 		if err != nil {
